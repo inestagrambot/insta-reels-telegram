@@ -1,3 +1,5 @@
+# Instagram Reels -> Telegram  (GitHub Actions)
 requests>=2.31,<3
-yt-dlp>=2024.1.1
-instaloader>=4.10,<6
+yt-dlp>=2026.8.19          # pinned to the current release for Instagram layout changes
+instaloader>=4.15,<6  # fallback scraper
+curl_cffi>=0.16.3       # enables yt-dlp TLS/JA3 impersonation (anti-login-wall)
