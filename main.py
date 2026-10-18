@@ -58,6 +58,9 @@ HISTORY_LIMIT = max(50, int(os.getenv("HISTORY_LIMIT", "800")))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "180"))
 SOCKET_TIMEOUT = int(os.getenv("SOCKET_TIMEOUT", "30"))
 SUMMARY_MODE = os.getenv("SEND_RUN_SUMMARY", "new").strip().lower()
+# Real-browser TLS/JA3 impersonation for yt-dlp. Only activated when the
+# optional curl_cffi backend is importable, so it can never break a run.
+IMPERSONATE = os.getenv("YTDLP_IMPERSONATE", "chrome").strip()
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 GH_API = "https://api.github.com"
@@ -228,8 +231,59 @@ def build_fallback_message(user: str, title: str, url: str, reason: str) -> str:
 # --------------------------------------------------------------------------- #
 # Reel discovery - yt-dlp (primary)
 # --------------------------------------------------------------------------- #
+def profile_url_candidates(user: str) -> List[str]:
+    """Profile URLs to try, best first.
+
+    Only ``https://www.instagram.com/<handle>/`` is claimed by yt-dlp's
+    ``instagram:user`` extractor.  ``/<handle>/reels/`` matches *no* Instagram
+    extractor, so yt-dlp falls through to the generic extractor, Instagram
+    redirects it to /accounts/login/?next=..., and the run dies with
+    ``ERROR: Unsupported URL``.  It is kept as a lower-priority attempt only.
+    """
+    return [
+        f"https://www.instagram.com/{user}/",
+        f"https://www.instagram.com/{user}/reels/",
+    ]
+
+
+def instagram_url_supported(url: str) -> bool:
+    """True when an installed yt-dlp Instagram extractor claims this URL."""
+    try:
+        from yt_dlp.extractor import gen_extractor_classes
+    except Exception:
+        return True  # cannot introspect -> let yt-dlp decide
+    try:
+        for ie in gen_extractor_classes():
+            name = (ie.IE_NAME or "").lower()
+            if "instagram" in name and ie.suitable(url):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def ytdlp_extractor_options() -> Dict[str, Any]:
+    """Extractor-level options shared by listing and downloading."""
+    options: Dict[str, Any] = {
+        "http_headers": {
+            "User-Agent": UA,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_retries": 3,
+        "sleep_interval_requests": 1,
+    }
+    if IMPERSONATE and IMPERSONATE.lower() not in {"0", "false", "no", "off", ""}:
+        try:
+            import curl_cffi  # noqa: F401  (required by yt-dlp impersonation)
+            options["impersonate"] = IMPERSONATE
+        except Exception:
+            log.info("curl_cffi not installed - yt-dlp impersonation disabled")
+    return options
+
+
 def yt_dlp_list(user: str, cookie: Optional[str], limit: int) -> List[Dict[str, Any]]:
     from yt_dlp import YoutubeDL
+    from yt_dlp.utils import DownloadError
 
     options: Dict[str, Any] = {
         "quiet": True,
@@ -240,12 +294,41 @@ def yt_dlp_list(user: str, cookie: Optional[str], limit: int) -> List[Dict[str, 
         "ignoreerrors": True,
         "socket_timeout": SOCKET_TIMEOUT,
     }
+    options.update(ytdlp_extractor_options())
     if cookie:
         options["cookiefile"] = cookie
 
-    url = f"https://www.instagram.com/{user}/reels/"
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info: Any = None
+    for url in profile_url_candidates(user):
+        if not instagram_url_supported(url):
+            log.warning(
+                "[%s] no yt-dlp Instagram extractor matches %s - skipped "
+                "(passing it to yt-dlp anyway is exactly what raises "
+                "'Unsupported URL')", user, url,
+            )
+            continue
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info and (info.get("entries") or info.get("id")):
+                log.info("[%s] yt-dlp listed via %s", user, url)
+                break
+            log.warning("[%s] yt-dlp returned no entries for %s", user, url)
+        except DownloadError as exc:
+            message = str(exc)
+            if "Unsupported URL" in message:
+                log.warning("[%s] %s is not supported by any installed yt-dlp extractor",
+                            user, url)
+            elif "empty media response" in message or "login" in message.lower():
+                log.warning(
+                    "[%s] Instagram returned a login wall for %s - add the "
+                    "IG_SESSIONID secret (with IG_USERNAME) to authenticate",
+                    user, url,
+                )
+            else:
+                log.warning("[%s] yt-dlp failed on %s: %s", user, url, message)
+        except Exception as exc:
+            log.warning("[%s] unexpected yt-dlp error on %s: %s", user, url, exc)
 
     reels: List[Dict[str, Any]] = []
     for entry in (info or {}).get("entries") or []:
@@ -291,6 +374,7 @@ def yt_dlp_download(reel: Dict[str, Any], dest_dir: Path, cookie: Optional[str])
         "fragment_retries": 2,
         "overwrites": True,
     }
+    options.update(ytdlp_extractor_options())
     if cookie:
         options["cookiefile"] = cookie
 
@@ -400,13 +484,18 @@ def deliver_reel(user: str, reel: Dict[str, Any], tmpdir: Path, cookie: Optional
     path: Optional[Path] = None
     failure_reason = ""
 
-    try:
-        path = yt_dlp_download(reel, workdir, cookie)
-        if path is None:
-            failure_reason = "download returned no file"
-    except Exception as exc:
-        failure_reason = f"yt-dlp error: {exc}"
-        log.warning("[%s/%s] download via yt-dlp failed: %s", user, reel_id, exc)
+    if not instagram_url_supported(url):
+        failure_reason = "no yt-dlp extractor for this URL"
+        log.warning("[%s/%s] %s - skipping straight to the direct-URL fallback",
+                    user, reel_id, failure_reason)
+    else:
+        try:
+            path = yt_dlp_download(reel, workdir, cookie)
+            if path is None:
+                failure_reason = "download returned no file"
+        except Exception as exc:
+            failure_reason = f"yt-dlp error: {exc}"
+            log.warning("[%s/%s] download via yt-dlp failed: %s", user, reel_id, exc)
 
     if path is None and reel.get("_direct_url"):
         log.info("[%s/%s] retrying with the direct CDN url", user, reel_id)
