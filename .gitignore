@@ -1,0 +1,7 @@
+reels_*/
+__pycache__/
+*.pyc
+ig_cookies.txt
+.env
+*.mp4
+.venv/
